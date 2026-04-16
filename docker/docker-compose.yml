@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: growth-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: superset_user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: growth_model
+    ports:
+      - "5432:5432"
+    volumes:
+      - growth_pgdata:/var/lib/postgresql/data
+      - ../data:/import
+
+volumes:
+  growth_pgdata:
