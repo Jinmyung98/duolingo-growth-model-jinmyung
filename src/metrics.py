@@ -202,6 +202,38 @@ def _trailing_window_active_users(
     out = pd.DataFrame(result_rows)
     return out.sort_values(["date"] + keys).reset_index(drop=True)
 
+def _enrich_with_user_groups(
+    df: pd.DataFrame,
+    users: Optional[pd.DataFrame],
+    *,
+    required_group_cols: Sequence[str],
+    df_name: str,
+) -> pd.DataFrame:
+    """
+    Ensure group columns exist on df. If missing, attach from users via user_id.
+    """
+    out = df.copy()
+    missing = [c for c in required_group_cols if c not in out.columns]
+
+    if not missing:
+        return out
+
+    if users is None:
+        raise ValueError(
+            f"{df_name} is missing grouping columns {missing}. "
+            f"Provide users to enrich {df_name} by user_id."
+        )
+
+    _require_cols(users, ["user_id"] + list(missing), "users")
+    u = users[["user_id"] + list(missing)].drop_duplicates(subset=["user_id"])
+
+    out = out.merge(u, on="user_id", how="left")
+
+    still_missing = [c for c in required_group_cols if c not in out.columns]
+    if still_missing:
+        raise ValueError(f"Could not enrich {df_name} with grouping columns: {still_missing}")
+
+    return out
 
 # -----------------------
 # Core Metrics
@@ -262,6 +294,7 @@ def compute_retention(
     *,
     active_event_names: Optional[Sequence[str]] = None,
     by_variant: bool = True,
+    drop_incomplete: bool = True,
 ) -> pd.DataFrame:
     """
     Cohort retention:
@@ -269,34 +302,60 @@ def compute_retention(
 
     Output (long-form):
     cohort_date, day_n, cohort_size, retained_users, retention_rate, [variant]
+
+    Parameters
+    ----------
+    drop_incomplete:
+        If True, exclude cohort-day pairs whose target_date is beyond the observed
+        event horizon. This avoids showing recent cohorts as artificial zero retention.
     """
     _require_cols(users, ["user_id", "signup_date"], "users")
     us = users.copy()
     us["signup_date"] = _to_date_series(us["signup_date"])
 
     ev = _prep_events(events, active_event_names=active_event_names)
-    ev = ev.loc[ev["_is_active_event"], ["user_id", "event_date"] + (["variant"] if "variant" in ev.columns else [])].drop_duplicates()
+    ev = ev.loc[
+        ev["_is_active_event"],
+        ["user_id", "event_date"] + (["variant"] if "variant" in ev.columns else [])
+    ].drop_duplicates()
+
     ev = ev.rename(columns={"event_date": "active_date"})
     ev["active_date"] = pd.to_datetime(ev["active_date"]).dt.date
+
+    if ev.empty:
+        cols = ["cohort_date", "day_n", "cohort_size", "retained_users", "retention_rate"]
+        if by_variant and "variant" in us.columns:
+            cols.append("variant")
+        return pd.DataFrame(columns=cols)
+
+    max_event_date = ev["active_date"].max()
 
     if isinstance(n_days, int):
         n_list = [n_days]
     else:
         n_list = list(n_days)
 
-    # Cohort size
     cohort_keys = ["signup_date"] + (["variant"] if by_variant and "variant" in us.columns else [])
-    cohort_sizes = us.groupby(cohort_keys, as_index=False)["user_id"].nunique().rename(columns={"user_id": "cohort_size"})
+    cohort_sizes = (
+        us.groupby(cohort_keys, as_index=False)["user_id"]
+        .nunique()
+        .rename(columns={"user_id": "cohort_size"})
+    )
 
-    # Join users to activity
     base = us[["user_id", "signup_date"] + (["variant"] if by_variant and "variant" in us.columns else [])].copy()
 
     rows = []
     for n in n_list:
         tmp = base.copy()
-        tmp["target_date"] = (pd.to_datetime(tmp["signup_date"]) + pd.to_timedelta(n, unit="D")).dt.date
+        tmp["target_date"] = (pd.to_datetime(tmp["signup_date"]) + pd.to_timedelta(int(n), unit="D")).dt.date
+        tmp["is_observable"] = tmp["target_date"] <= max_event_date
 
-        # Determine whether user active on target_date
+        if drop_incomplete:
+            tmp = tmp.loc[tmp["is_observable"]].copy()
+
+        if tmp.empty:
+            continue
+
         join_cols = ["user_id"]
         if by_variant and "variant" in base.columns and "variant" in ev.columns:
             join_cols.append("variant")
@@ -306,22 +365,46 @@ def compute_retention(
             how="left",
             left_on=join_cols + ["target_date"],
             right_on=join_cols + ["active_date"],
-            indicator=False,
         )
 
         merged["_retained"] = (~merged["active_date"].isna()).astype(int)
 
         grp_cols = ["signup_date"] + (["variant"] if by_variant and "variant" in base.columns else [])
-        agg = merged.groupby(grp_cols, as_index=False)["_retained"].sum().rename(columns={"_retained": "retained_users"})
+        agg = (
+            merged.groupby(grp_cols, as_index=False)["_retained"]
+            .sum()
+            .rename(columns={"_retained": "retained_users"})
+        )
         agg["day_n"] = int(n)
 
-        # attach cohort size
         out = agg.merge(cohort_sizes, on=grp_cols, how="left")
         out["retention_rate"] = out["retained_users"] / out["cohort_size"]
         out = out.rename(columns={"signup_date": "cohort_date"})
+
+        if not drop_incomplete:
+            obs = (
+                tmp.groupby(grp_cols, as_index=False)["is_observable"]
+                .all()
+                .rename(columns={"is_observable": "is_fully_observed"})
+                .rename(columns={"signup_date": "cohort_date"})
+            )
+            out = out.merge(
+                obs,
+                on=["cohort_date"] + (["variant"] if by_variant and "variant" in out.columns else []),
+                how="left"
+            )
+
         rows.append(out)
 
-    res = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if not rows:
+        cols = ["cohort_date", "day_n", "cohort_size", "retained_users", "retention_rate"]
+        if by_variant and "variant" in us.columns:
+            cols.append("variant")
+        if not drop_incomplete:
+            cols.append("is_fully_observed")
+        return pd.DataFrame(columns=cols)
+
+    res = pd.concat(rows, ignore_index=True)
     sort_cols = ["cohort_date", "day_n"] + (["variant"] if by_variant and "variant" in us.columns else [])
     return res.sort_values(sort_cols).reset_index(drop=True)
 
@@ -329,6 +412,7 @@ def compute_retention(
 def compute_sessions_per_user(
     sessions: pd.DataFrame,
     events: Optional[pd.DataFrame] = None,
+    users: Optional[pd.DataFrame] = None,
     *,
     active_event_names: Optional[Sequence[str]] = None,
     group_cols: Optional[Sequence[str]] = ("variant",),
@@ -342,25 +426,36 @@ def compute_sessions_per_user(
     active_user_source:
     - "events" (recommended): DAU computed from events active_event_names
     - "sessions": active users approximated as unique users with >=1 session that day
+
+    Notes
+    -----
+    If group_cols include user-level attributes not present on sessions
+    (e.g. variant), provide users so sessions can be enriched by user_id.
     """
     se = _prep_sessions(sessions)
     keys = _group_keys(group_cols)
 
-    # sessions per day
-    sess_keys = ["session_date"] + [c for c in keys if c in se.columns]
-    sess_daily = se.groupby(sess_keys, as_index=False)["session_id"].nunique().rename(
-        columns={"session_date": "date", "session_id": "sessions"}
+    if keys:
+        se = _enrich_with_user_groups(se, users, required_group_cols=keys, df_name="sessions")
+
+    sess_keys = ["session_date"] + keys
+    sess_daily = (
+        se.groupby(sess_keys, as_index=False)["session_id"]
+        .nunique()
+        .rename(columns={"session_date": "date", "session_id": "sessions"})
     )
     sess_daily["date"] = pd.to_datetime(sess_daily["date"]).dt.date
 
     if active_user_source == "events":
         if events is None:
             raise ValueError("events must be provided when active_user_source='events'")
-        dau = compute_dau(events, active_event_names=active_event_names, group_cols=keys if keys else None)
-        dau = dau.rename(columns={"dau": "active_users"})
+        dau = compute_dau(
+            events,
+            active_event_names=active_event_names,
+            group_cols=keys if keys else None,
+        ).rename(columns={"dau": "active_users"})
     elif active_user_source == "sessions":
-        # Approx: unique users with sessions that day
-        au_keys = ["session_date"] + [c for c in keys if c in se.columns]
+        au_keys = ["session_date"] + keys
         dau = (
             se.groupby(au_keys, as_index=False)["user_id"]
             .nunique()
@@ -370,12 +465,14 @@ def compute_sessions_per_user(
     else:
         raise ValueError("active_user_source must be 'events' or 'sessions'")
 
-    # merge
-    merge_keys = ["date"] + [c for c in keys if c in sess_daily.columns and c in dau.columns]
+    merge_keys = ["date"] + keys
     out = sess_daily.merge(dau, on=merge_keys, how="outer").fillna({"sessions": 0, "active_users": 0})
+
+    out["sessions"] = out["sessions"].astype(int)
+    out["active_users"] = out["active_users"].astype(int)
     out["sessions_per_user"] = out.apply(
         lambda r: (r["sessions"] / r["active_users"]) if r["active_users"] > 0 else 0.0,
-        axis=1
+        axis=1,
     )
 
     return out.sort_values(merge_keys).reset_index(drop=True)
@@ -515,7 +612,7 @@ LIFECYCLE_STATES = [
 
 def compute_lifecycle_counts(
     events: pd.DataFrame,
-    users: Optional[pd.DataFrame] = None,
+    users: pd.DataFrame,
     *,
     active_event_names: Optional[Sequence[str]] = None,
     group_cols: Optional[Sequence[str]] = ("variant",),
@@ -525,84 +622,130 @@ def compute_lifecycle_counts(
     """
     Compute daily lifecycle counts by state using window definitions:
 
-    - New: date == signup_date (requires users)
+    - New: date == signup_date
     - Current: active today AND active in last 7 days (excluding today) >= 1
-    - Reactivated: active today AND no activity in last 7 days (excluding today) AND activity in last 30 days (excluding today) >= 1
+    - Reactivated: active today AND no activity in last 7 days (excluding today)
+      AND activity in last 30 days (excluding today) >= 1
     - Resurrected: active today AND no activity in last 30 days (excluding today)
     - AtRiskWAU: inactive today AND activity in last 7 days (including today) >= 1
     - AtRiskMAU: no activity in last 7 days AND activity in last 30 days >= 1
     - Dormant: no activity in last 30 days
 
-    Notes:
-    - This is path/window-based, so it needs per-user daily activity series.
-    - For large datasets, consider materializing active user-days first.
-
     Output columns:
     date, state, users, [group cols]
     """
-    ev = _prep_events(events, active_event_names=active_event_names)
+    _require_cols(users, ["user_id", "signup_date"], "users")
+    us = users.copy()
+    us["signup_date"] = _to_date_series(us["signup_date"])
+
     keys = _group_keys(group_cols)
+    if keys:
+        _require_cols(us, ["user_id", "signup_date"] + keys, "users")
 
-    # Build unique active user-days
-    ud = ev.loc[ev["_is_active_event"], ["user_id", "event_date"] + [c for c in keys if c in ev.columns]].drop_duplicates()
+    ev = _prep_events(events, active_event_names=active_event_names)
+
+    # Attach grouping columns to events if they are not already present there
+    if keys:
+        ev = _enrich_with_user_groups(ev, us, required_group_cols=keys, df_name="events")
+
+    # Unique active user-days
+    ud = ev.loc[
+        ev["_is_active_event"],
+        ["user_id", "event_date"] + keys
+    ].drop_duplicates()
+
     ud = ud.rename(columns={"event_date": "date"})
-    ud["date"] = pd.to_datetime(ud["date"]).dt.date
+    if not ud.empty:
+        ud["date"] = pd.to_datetime(ud["date"]).dt.date
 
-    if ud.empty:
-        cols = ["date"] + keys + ["state", "users"]
-        return pd.DataFrame(columns=cols)
+    # Determine overall computation range
+    signup_min = us["signup_date"].min()
+    signup_max = us["signup_date"].max()
+    active_min = ud["date"].min() if not ud.empty else signup_min
+    active_max = ud["date"].max() if not ud.empty else signup_max
 
-    # Determine date range to compute over
-    d0 = pd.to_datetime(date_min).date() if date_min else ud["date"].min()
-    d1 = pd.to_datetime(date_max).date() if date_max else ud["date"].max()
+    d0 = pd.to_datetime(date_min).date() if date_min else min(signup_min, active_min)
+    d1 = pd.to_datetime(date_max).date() if date_max else max(signup_max, active_max)
+
+    if d1 < d0:
+        raise ValueError(f"Invalid date range: date_min={d0}, date_max={d1}")
+
     all_dates = pd.date_range(d0, d1, freq="D").date
 
-    # Signup dates (for "New")
-    signup = None
-    if users is not None:
-        _require_cols(users, ["user_id", "signup_date"], "users")
-        signup = users[["user_id", "signup_date"] + ([c for c in keys if c in users.columns] if keys else [])].copy()
-        signup["signup_date"] = _to_date_series(signup["signup_date"])
-
     rows = []
-    for gvals, gdf in ud.groupby(keys, dropna=False) if keys else [(None, ud)]:
-        gdf = gdf.sort_values(["user_id", "date"])
-        # user -> set(active_dates)
-        active_dates_by_user = gdf.groupby("user_id")["date"].apply(set).to_dict()
 
-        # optional signup map
-        signup_map = {}
-        if signup is not None:
-            ssub = signup
+    if keys:
+        user_groups_iter = us.groupby(keys, dropna=False)
+    else:
+        user_groups_iter = [(None, us)]
+
+    for gvals, ugrp in user_groups_iter:
+        ugrp = ugrp.copy().sort_values(["user_id", "signup_date"])
+        signup_map = dict(zip(ugrp["user_id"], ugrp["signup_date"]))
+        group_user_ids = list(signup_map.keys())
+
+        # active dates restricted to this group
+        if not ud.empty:
             if keys:
-                if not isinstance(gvals, tuple):
-                    gvals = (gvals,)
-                for k, v in zip(keys, gvals):
-                    if k in ssub.columns:
-                        ssub = ssub.loc[ssub[k].eq(v)]
-            signup_map = dict(zip(ssub["user_id"], ssub["signup_date"]))
+                gdf = ud.copy()
+                gtuple = gvals if isinstance(gvals, tuple) else (gvals,)
+                for k, v in zip(keys, gtuple):
+                    gdf = gdf.loc[gdf[k].eq(v)]
+            else:
+                gdf = ud
+            active_dates_by_user = gdf.groupby("user_id")["date"].apply(set).to_dict() if not gdf.empty else {}
+        else:
+            active_dates_by_user = {}
 
         for t in all_dates:
-            # For each user, compute A_t and window counts (simple set logic)
-            # This is not the most optimized approach but works for moderate synthetic data.
             counts = {s: 0 for s in LIFECYCLE_STATES}
 
-            t7_prev = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=7), pd.to_datetime(t) - pd.Timedelta(days=1), freq="D").date)
-            t30_prev = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=30), pd.to_datetime(t) - pd.Timedelta(days=1), freq="D").date)
-            t7_incl = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=6), pd.to_datetime(t), freq="D").date)
-            t30_incl = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=29), pd.to_datetime(t), freq="D").date)
+            t7_prev = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=7),
+                    pd.to_datetime(t) - pd.Timedelta(days=1),
+                    freq="D",
+                ).date
+            )
+            t30_prev = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=30),
+                    pd.to_datetime(t) - pd.Timedelta(days=1),
+                    freq="D",
+                ).date
+            )
+            t7_incl = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=6),
+                    pd.to_datetime(t),
+                    freq="D",
+                ).date
+            )
+            t30_incl = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=29),
+                    pd.to_datetime(t),
+                    freq="D",
+                ).date
+            )
 
-            for uid, act_set in active_dates_by_user.items():
+            for uid in group_user_ids:
+                sdate = signup_map[uid]
+                if sdate > t:
+                    continue
+
+                act_set = active_dates_by_user.get(uid, set())
+
+                # New takes precedence on signup day
+                if sdate == t:
+                    counts["New"] += 1
+                    continue
+
                 A_today = 1 if t in act_set else 0
                 w7_prev = len(act_set & t7_prev)
                 w30_prev = len(act_set & t30_prev)
                 w7_incl = len(act_set & t7_incl)
                 w30_incl = len(act_set & t30_incl)
-
-                # New
-                if uid in signup_map and signup_map[uid] == t:
-                    counts["New"] += 1
-                    continue
 
                 if A_today == 1:
                     if w7_prev >= 1:
@@ -620,12 +763,12 @@ def compute_lifecycle_counts(
                         counts["Dormant"] += 1
 
             for state, n in counts.items():
-                row = {"date": t, "state": state, "users": n}
+                row = {"date": t, "state": state, "users": int(n)}
                 if keys:
-                    if not isinstance(gvals, tuple):
-                        gvals = (gvals,)
-                    row.update({k: v for k, v in zip(keys, gvals)})
+                    gtuple = gvals if isinstance(gvals, tuple) else (gvals,)
+                    row.update({k: v for k, v in zip(keys, gtuple)})
                 rows.append(row)
 
     out = pd.DataFrame(rows)
-    return out.sort_values(["date"] + keys + ["state"]).reset_index(drop=True)
+    sort_cols = ["date"] + keys + ["state"]
+    return out.sort_values(sort_cols).reset_index(drop=True)

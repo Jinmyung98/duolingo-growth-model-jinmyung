@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 
 import time
-import sys
 
 # -------------------------
 # 0) Constants & helpers
@@ -325,58 +324,95 @@ def daily_signup_curve(day_idx: int, cfg: SimConfig) -> float:
 def allocate_signups(cfg: SimConfig, rng: np.random.Generator) -> List[int]:
     """
     Return list of length n_days: signups per day, summing to n_users.
+
+    This version is robust to infeasible hard min/max settings by using
+    effective bounds that are feasible for the requested (n_users, n_days).
     """
+    if cfg.n_days <= 0:
+        raise ValueError("n_days must be positive")
+    if cfg.n_users < 0:
+        raise ValueError("n_users must be non-negative")
+
+    if cfg.n_users == 0:
+        return [0] * cfg.n_days
+
+    # Start from requested bounds
+    req_min = int(max(0, cfg.min_daily_signups))
+    req_max = int(max(req_min, cfg.max_daily_signups))
+
+    # Make bounds feasible for the requested total.
+    # Lower bound cannot exceed floor(total / days)
+    effective_min = min(req_min, cfg.n_users // cfg.n_days)
+
+    # Upper bound must be at least enough to fit all users somewhere
+    effective_max = max(req_max, int(np.ceil(cfg.n_users / cfg.n_days)))
+
+    if effective_min > effective_max:
+        raise ValueError(
+            f"Infeasible effective bounds: effective_min={effective_min}, "
+            f"effective_max={effective_max}."
+        )
+
     weights = np.array([daily_signup_curve(t, cfg) for t in range(cfg.n_days)], dtype=float)
+    if not np.isfinite(weights).all() or weights.sum() <= 0:
+        raise ValueError("daily signup weights are invalid")
     weights = weights / weights.sum()
 
     raw = rng.multinomial(cfg.n_users, weights)
-
-    # enforce min/max bounds softly by redistribution
     signups = raw.astype(int).tolist()
 
-    # cap above max
+    # Cap above max
     overflow = 0
     for t in range(cfg.n_days):
-        if signups[t] > cfg.max_daily_signups:
-            overflow += signups[t] - cfg.max_daily_signups
-            signups[t] = cfg.max_daily_signups
+        if signups[t] > effective_max:
+            overflow += signups[t] - effective_max
+            signups[t] = effective_max
 
-    # raise below min
+    # Raise below min
     deficit = 0
     for t in range(cfg.n_days):
-        if signups[t] < cfg.min_daily_signups:
-            deficit += cfg.min_daily_signups - signups[t]
-            signups[t] = cfg.min_daily_signups
+        if signups[t] < effective_min:
+            deficit += effective_min - signups[t]
+            signups[t] = effective_min
 
-    # reconcile total to cfg.n_users
+    # Reconcile total exactly
     total = sum(signups)
-    target = cfg.n_users
-    diff = total - target  # positive means too many
+    diff = total - cfg.n_users  # positive => too many assigned
 
-    # absorb diff by adjusting days with room
-    if diff != 0:
-        order = list(range(cfg.n_days))
-        rng.shuffle(order)
+    order = list(range(cfg.n_days))
+    rng.shuffle(order)
+
+    if diff > 0:
+        # remove from days above effective_min
         for t in order:
             if diff == 0:
                 break
-            if diff > 0:
-                # reduce if above min
-                room = signups[t] - cfg.min_daily_signups
-                if room > 0:
-                    dec = min(room, diff)
-                    signups[t] -= dec
-                    diff -= dec
-            else:
-                # increase if below max
-                room = cfg.max_daily_signups - signups[t]
-                if room > 0:
-                    inc = min(room, -diff)
-                    signups[t] += inc
-                    diff += inc
+            room = signups[t] - effective_min
+            if room > 0:
+                dec = min(room, diff)
+                signups[t] -= dec
+                diff -= dec
+    elif diff < 0:
+        # add to days below effective_max
+        for t in order:
+            if diff == 0:
+                break
+            room = effective_max - signups[t]
+            if room > 0:
+                inc = min(room, -diff)
+                signups[t] += inc
+                diff += inc
 
-    # final sanity
-    assert sum(signups) == cfg.n_users, f"Signups sum mismatch: {sum(signups)} vs {cfg.n_users}"
+    if diff != 0:
+        raise ValueError(
+            "Could not reconcile signup allocation exactly. "
+            f"Remaining diff={diff}, total={sum(signups)}, target={cfg.n_users}, "
+            f"effective_min={effective_min}, effective_max={effective_max}."
+        )
+
+    if sum(signups) != cfg.n_users:
+        raise AssertionError(f"Signups sum mismatch: {sum(signups)} vs {cfg.n_users}")
+
     return signups
 
 
@@ -464,11 +500,6 @@ def dow_effect(day_idx: int) -> float:
     # day 0 corresponds to cfg.start_date; we'll treat it as "weekday-like"
     # We'll implement a mild sine wave with weekly period.
     return 0.10 * np.sin(2 * np.pi * (day_idx % 7) / 7.0)
-
-
-def choose_variant_for_user(rng: np.random.Generator) -> str:
-    # fixed 50/50 assignment at signup for Phase 1 simplicity
-    return str(rng.choice(["control", "treatment"]))
 
 
 def choose_experiment_id() -> str:
