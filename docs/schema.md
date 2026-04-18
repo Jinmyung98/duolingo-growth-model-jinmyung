@@ -17,7 +17,7 @@ The schema is designed to support:
 
 ---
 
-## 0) ER Diagram (GitHub renders Mermaid)
+## 0) ER Diagram
 
 ```mermaid
 erDiagram
