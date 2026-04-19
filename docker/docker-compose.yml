@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: superset_user
-      POSTGRES_PASSWORD: passwordhere
+      POSTGRES_PASSWORD: password
       POSTGRES_DB: growth_model
     ports:
       - "5432:5432"
