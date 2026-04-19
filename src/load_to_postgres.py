@@ -203,7 +203,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=5432)
     parser.add_argument("--dbname", type=str, default="growth_model")
     parser.add_argument("--user", type=str, default="superset_user")
-    parser.add_argument("--password", type=str, required=True)
+    parser.add_argument("--password", type=str, default="password")
 
     parser.add_argument("--raw_dir", type=str, default="data")
     parser.add_argument("--derived_dir", type=str, default="data/derived")
