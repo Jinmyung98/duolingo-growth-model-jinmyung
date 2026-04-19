@@ -1224,7 +1224,7 @@ def run_sanity_checks(users: pd.DataFrame, sessions: pd.DataFrame, events: pd.Da
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n_users", type=int, default=10000)
+    ap.add_argument("--n_users", type=int, default=1000)
     ap.add_argument("--n_days", type=int, default=365)
     ap.add_argument("--seed", type=int, default=1239)
     ap.add_argument("--out_dir", type=str, default="data")

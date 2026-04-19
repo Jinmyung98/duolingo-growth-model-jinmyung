@@ -16,9 +16,11 @@ Tables (Phase 1 schema):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Union, List
+from typing import Iterable, Optional, Sequence, Union, List, Dict
 
 import pandas as pd
+
+import time
 
 
 # -----------------------
@@ -234,6 +236,111 @@ def _enrich_with_user_groups(
         raise ValueError(f"Could not enrich {df_name} with grouping columns: {still_missing}")
 
     return out
+
+def _assign_lifecycle_state_from_fact_with_progress(
+    fact_user_daily: pd.DataFrame,
+    *,
+    verbose: bool = True,
+    every: int = 500,
+) -> pd.DataFrame:
+    """
+    Assign lifecycle_state directly from fact_user_daily, with progress logging.
+    """
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(f"[lifecycle] {msg}", flush=True)
+
+    _require_cols(
+        fact_user_daily,
+        ["date", "user_id", "signup_date", "is_active"],
+        "fact_user_daily",
+    )
+
+    f = fact_user_daily.copy()
+    f["date"] = _to_date_series(f["date"])
+    f["signup_date"] = _to_date_series(f["signup_date"])
+    f = f.sort_values(["user_id", "date"]).reset_index(drop=True)
+
+    user_ids = f["user_id"].drop_duplicates().tolist()
+    total_users = len(user_ids)
+    out_parts = []
+    t0 = time.time()
+
+    for i, (uid, g) in enumerate(f.groupby("user_id", sort=False), start=1):
+        g = g.sort_values("date").copy()
+        active_dates = set(g.loc[g["is_active"].astype(bool), "date"])
+
+        states = []
+        for _, r in g.iterrows():
+            t = r["date"]
+            sdate = r["signup_date"]
+
+            if t == sdate:
+                states.append("New")
+                continue
+
+            t7_prev = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=7),
+                    pd.to_datetime(t) - pd.Timedelta(days=1),
+                    freq="D",
+                ).date
+            )
+            t30_prev = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=30),
+                    pd.to_datetime(t) - pd.Timedelta(days=1),
+                    freq="D",
+                ).date
+            )
+            t7_incl = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=6),
+                    pd.to_datetime(t),
+                    freq="D",
+                ).date
+            )
+            t30_incl = set(
+                pd.date_range(
+                    pd.to_datetime(t) - pd.Timedelta(days=29),
+                    pd.to_datetime(t),
+                    freq="D",
+                ).date
+            )
+
+            A_today = t in active_dates
+            w7_prev = len(active_dates & t7_prev)
+            w30_prev = len(active_dates & t30_prev)
+            w7_incl = len(active_dates & t7_incl)
+            w30_incl = len(active_dates & t30_incl)
+
+            if A_today:
+                if w7_prev >= 1:
+                    states.append("Current")
+                elif w30_prev >= 1:
+                    states.append("Reactivated")
+                else:
+                    states.append("Resurrected")
+            else:
+                if w7_incl >= 1:
+                    states.append("AtRiskWAU")
+                elif w30_incl >= 1:
+                    states.append("AtRiskMAU")
+                else:
+                    states.append("Dormant")
+
+        g["lifecycle_state"] = states
+        out_parts.append(g)
+
+        if i % every == 0 or i == total_users:
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else float("inf")
+            remaining = total_users - i
+            eta = remaining / rate if rate > 0 else float("inf")
+            log(f"{i:,}/{total_users:,} users processed | elapsed {elapsed:,.1f}s | ETA {eta:,.1f}s")
+
+    return pd.concat(out_parts, ignore_index=True)
 
 # -----------------------
 # Core Metrics
@@ -772,3 +879,581 @@ def compute_lifecycle_counts(
     out = pd.DataFrame(rows)
     sort_cols = ["date"] + keys + ["state"]
     return out.sort_values(sort_cols).reset_index(drop=True)
+
+
+
+def _safe_divide(numer: pd.Series, denom: pd.Series) -> pd.Series:
+    numer = numer.astype(float)
+    denom = denom.astype(float)
+    out = numer / denom.where(denom != 0)
+    return out.fillna(0.0)
+
+
+def _build_user_date_spine(
+    users: pd.DataFrame,
+    *,
+    date_min: Optional[str] = None,
+    date_max: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Build 1 row per signed-up user per date, starting from signup_date.
+    """
+    _require_cols(users, ["user_id", "signup_date"], "users")
+    us = users.copy()
+    us["signup_date"] = _to_date_series(us["signup_date"])
+
+    global_min = pd.to_datetime(date_min).date() if date_min else us["signup_date"].min()
+    global_max = pd.to_datetime(date_max).date() if date_max else us["signup_date"].max()
+
+    if global_max < global_min:
+        raise ValueError(f"Invalid date range: {global_min} > {global_max}")
+
+    rows = []
+    for _, r in us.iterrows():
+        sdate = r["signup_date"]
+        start = max(sdate, global_min)
+        if start > global_max:
+            continue
+        for d in pd.date_range(start, global_max, freq="D").date:
+            rows.append({
+                "date": d,
+                "user_id": r["user_id"],
+                "signup_date": sdate,
+            })
+
+    spine = pd.DataFrame(rows)
+    if spine.empty:
+        return pd.DataFrame(columns=["date", "user_id", "signup_date", "days_since_signup"])
+
+    spine["days_since_signup"] = (
+        pd.to_datetime(spine["date"]) - pd.to_datetime(spine["signup_date"])
+    ).dt.days.astype(int)
+
+    return spine
+
+
+def build_fact_user_daily(
+    users: pd.DataFrame,
+    events: pd.DataFrame,
+    sessions: pd.DataFrame,
+    *,
+    active_event_names: Optional[Sequence[str]] = None,
+    date_min: Optional[str] = None,
+    date_max: Optional[str] = None,
+    include_lifecycle: bool = True,
+    sample_n_users: Optional[int] = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Build fact_user_daily with grain = 1 user x 1 date.
+
+    Improvements in this version
+    ----------------------------
+    - prints progress / heartbeats inside the function
+    - supports sample_n_users for faster debugging
+    - supports include_lifecycle=False to isolate bottlenecks
+    - avoids some unnecessary merges / repeated conversions
+    """
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(f"[fact_user_daily] {msg}", flush=True)
+
+    t0 = time.time()
+    log("START")
+
+    _require_cols(users, ["user_id", "signup_date"], "users")
+
+    # -----------------------
+    # 1) Prepare users
+    # -----------------------
+    t = time.time()
+    us = users.copy()
+    us["signup_date"] = _to_date_series(us["signup_date"])
+
+    if sample_n_users is not None:
+        if sample_n_users <= 0:
+            raise ValueError("sample_n_users must be positive when provided")
+        sample_n = min(sample_n_users, len(us))
+        us = us.sort_values("user_id").head(sample_n).copy()
+        keep_user_ids = set(us["user_id"].tolist())
+        events = events.loc[events["user_id"].isin(keep_user_ids)].copy()
+        sessions = sessions.loc[sessions["user_id"].isin(keep_user_ids)].copy()
+        log(f"sample mode enabled: users={len(us):,}, events={len(events):,}, sessions={len(sessions):,}")
+
+    user_cols = ["user_id", "signup_date"]
+    for c in ["variant", "country", "signup_channel", "language_target", "device_os", "app_version"]:
+        if c in us.columns:
+            user_cols.append(c)
+    if "is_premium_at_signup" in us.columns:
+        user_cols.append("is_premium_at_signup")
+
+    uattrs = us[user_cols].drop_duplicates(subset=["user_id"]).copy()
+    log(f"1/8 users prepared | shape={uattrs.shape[0]:,}x{uattrs.shape[1]} | {time.time()-t:,.1f}s")
+
+    # -----------------------
+    # 2) Prepare events / sessions
+    # -----------------------
+    t = time.time()
+    ev = _prep_events(events, active_event_names=active_event_names)
+    se = _prep_sessions(sessions)
+
+    # reduce to only relevant users
+    valid_user_ids = set(uattrs["user_id"].tolist())
+    ev = ev.loc[ev["user_id"].isin(valid_user_ids)].copy()
+    se = se.loc[se["user_id"].isin(valid_user_ids)].copy()
+
+    # normalize dates once
+    if not ev.empty:
+        ev["event_date"] = pd.to_datetime(ev["event_date"]).dt.date
+    if not se.empty:
+        se["session_date"] = pd.to_datetime(se["session_date"]).dt.date
+
+    inferred_max_candidates = [us["signup_date"].max()]
+    if not ev.empty:
+        inferred_max_candidates.append(ev["event_date"].max())
+    if not se.empty:
+        inferred_max_candidates.append(se["session_date"].max())
+    inferred_max = max(inferred_max_candidates)
+
+    final_date_max = date_max if date_max is not None else str(inferred_max)
+
+    log(
+        f"2/8 raw prepared | "
+        f"users={len(uattrs):,}, events={len(ev):,}, sessions={len(se):,}, "
+        f"date_max={final_date_max} | {time.time()-t:,.1f}s"
+    )
+
+    # -----------------------
+    # 3) Build user-date spine
+    # -----------------------
+    t = time.time()
+    spine = _build_user_date_spine(
+        us[["user_id", "signup_date"]].copy(),
+        date_min=date_min,
+        date_max=final_date_max,
+    )
+
+    if spine.empty:
+        log("3/8 spine empty -> returning empty fact_user_daily")
+        return pd.DataFrame(columns=[
+            "date", "user_id", "variant", "signup_date", "days_since_signup",
+            "is_active", "had_app_open", "had_lesson_started", "had_lesson_completed",
+            "sessions_count", "session_duration_sec", "lessons_completed", "xp_earned",
+            "hearts_lost", "streak_length_end_of_day", "is_premium", "lifecycle_state"
+        ])
+
+    fact = spine.merge(uattrs, on=["user_id", "signup_date"], how="left")
+    fact["date"] = pd.to_datetime(fact["date"]).dt.date
+    log(f"3/8 spine built | shape={fact.shape[0]:,}x{fact.shape[1]} | {time.time()-t:,.1f}s")
+
+    # -----------------------
+    # 4) Aggregate event-derived daily features
+    # -----------------------
+    t = time.time()
+    if ev.empty:
+        active_daily = pd.DataFrame(columns=["user_id", "date", "is_active"])
+        step_flags = pd.DataFrame(columns=["user_id", "date", "had_app_open", "had_lesson_started", "had_lesson_completed"])
+        event_rollup = pd.DataFrame(columns=["user_id", "date", "lessons_completed", "xp_earned", "hearts_lost"])
+        latest_daily = pd.DataFrame(columns=["user_id", "date", "streak_length_end_of_day", "is_premium"])
+    else:
+        ev_daily = ev.copy()
+        ev_daily = ev_daily.rename(columns={"event_date": "date"})
+
+        active_daily = (
+            ev_daily.groupby(["user_id", "date"], as_index=False)["_is_active_event"]
+            .max()
+            .rename(columns={"_is_active_event": "is_active"})
+        )
+
+        step_flags = (
+            ev_daily.assign(
+                had_app_open=ev_daily["event_name"].eq("app_open").astype("int8"),
+                had_lesson_started=ev_daily["event_name"].eq("lesson_started").astype("int8"),
+                had_lesson_completed=ev_daily["event_name"].eq("lesson_completed").astype("int8"),
+            )
+            .groupby(["user_id", "date"], as_index=False)[
+                ["had_app_open", "had_lesson_started", "had_lesson_completed"]
+            ]
+            .max()
+        )
+
+        event_rollup = (
+            ev_daily.assign(
+                lessons_completed=ev_daily["event_name"].eq("lesson_completed").astype("int16"),
+                hearts_lost=(-ev_daily["hearts_delta"]).clip(lower=0),
+            )
+            .groupby(["user_id", "date"], as_index=False)[["lessons_completed", "xp_delta", "hearts_lost"]]
+            .sum()
+            .rename(columns={"xp_delta": "xp_earned"})
+        )
+
+        # latest event of user-date
+        if "event_time" in ev_daily.columns:
+            ev_daily["event_time"] = pd.to_datetime(ev_daily["event_time"])
+            latest_daily = (
+                ev_daily.sort_values(["user_id", "date", "event_time"])
+                .groupby(["user_id", "date"], as_index=False)
+                .tail(1)[["user_id", "date", "streak_length", "is_premium"]]
+                .rename(columns={"streak_length": "streak_length_end_of_day"})
+            )
+        else:
+            latest_daily = (
+                ev_daily.groupby(["user_id", "date"], as_index=False)[["streak_length", "is_premium"]]
+                .last()
+                .rename(columns={"streak_length": "streak_length_end_of_day"})
+            )
+
+    log(
+        f"4/8 event daily aggregates built | "
+        f"active={len(active_daily):,}, steps={len(step_flags):,}, rollup={len(event_rollup):,}, latest={len(latest_daily):,} "
+        f"| {time.time()-t:,.1f}s"
+    )
+
+    # -----------------------
+    # 5) Aggregate session-derived daily features
+    # -----------------------
+    t = time.time()
+    if se.empty:
+        session_rollup = pd.DataFrame(columns=["user_id", "date", "sessions_count", "session_duration_sec"])
+    else:
+        se_daily = se.rename(columns={"session_date": "date"}).copy()
+        session_rollup = (
+            se_daily.groupby(["user_id", "date"], as_index=False)
+            .agg(
+                sessions_count=("session_id", "nunique"),
+                session_duration_sec=("session_duration_sec", "sum"),
+            )
+        )
+
+    log(f"5/8 session daily aggregates built | rows={len(session_rollup):,} | {time.time()-t:,.1f}s")
+
+    # -----------------------
+    # 6) Merge all daily features onto spine
+    # -----------------------
+    t = time.time()
+    for name, df in [
+        ("active_daily", active_daily),
+        ("step_flags", step_flags),
+        ("event_rollup", event_rollup),
+        ("latest_daily", latest_daily),
+        ("session_rollup", session_rollup),
+    ]:
+        if not df.empty:
+            fact = fact.merge(df, on=["user_id", "date"], how="left")
+            log(f"6/8 merged {name:<14} -> fact shape={fact.shape[0]:,}x{fact.shape[1]}")
+        else:
+            log(f"6/8 skipped empty {name}")
+
+    # fill defaults
+    for c in ["is_active", "had_app_open", "had_lesson_started", "had_lesson_completed"]:
+        if c not in fact.columns:
+            fact[c] = 0
+        fact[c] = fact[c].fillna(0).astype("int8")
+
+    for c in [
+        "sessions_count",
+        "session_duration_sec",
+        "lessons_completed",
+        "xp_earned",
+        "hearts_lost",
+        "streak_length_end_of_day",
+    ]:
+        if c not in fact.columns:
+            fact[c] = 0
+        fact[c] = fact[c].fillna(0).astype("int32")
+
+    # premium fallback for days without events
+    if "is_premium" not in fact.columns:
+        fact["is_premium"] = False
+    else:
+        if "is_premium_at_signup" in fact.columns:
+            fact["is_premium"] = fact["is_premium"].fillna(fact["is_premium_at_signup"]).fillna(False)
+        else:
+            fact["is_premium"] = fact["is_premium"].fillna(False)
+
+    log(f"6/8 merge + fill complete | shape={fact.shape[0]:,}x{fact.shape[1]} | {time.time()-t:,.1f}s")
+
+    # -----------------------
+    # 7) Lifecycle assignment
+    # -----------------------
+    t = time.time()
+    if include_lifecycle:
+        log("7/8 assigning lifecycle_state ... this may take a while")
+        fact = _assign_lifecycle_state_from_fact_with_progress(fact, verbose=verbose)
+    else:
+        fact["lifecycle_state"] = None
+        log("7/8 lifecycle skipped")
+
+    log(f"7/8 lifecycle complete | {time.time()-t:,.1f}s")
+
+    # -----------------------
+    # 8) Final column selection
+    # -----------------------
+    t = time.time()
+    wanted = [
+        "date", "user_id", "variant", "signup_date", "days_since_signup",
+        "is_active", "had_app_open", "had_lesson_started", "had_lesson_completed",
+        "sessions_count", "session_duration_sec", "lessons_completed", "xp_earned",
+        "hearts_lost", "streak_length_end_of_day", "is_premium", "lifecycle_state"
+    ]
+    existing = [c for c in wanted if c in fact.columns]
+    fact = fact[existing].sort_values(["date", "user_id"]).reset_index(drop=True)
+
+    log(f"8/8 final table ready | shape={fact.shape[0]:,}x{fact.shape[1]} | {time.time()-t:,.1f}s")
+    log(f"DONE | total {time.time()-t0:,.1f}s")
+
+    return fact
+
+
+def _assign_lifecycle_state_from_fact(fact_user_daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assign user-day lifecycle_state directly from fact_user_daily.
+    """
+    _require_cols(
+        fact_user_daily,
+        ["date", "user_id", "signup_date", "is_active"],
+        "fact_user_daily",
+    )
+    f = fact_user_daily.copy()
+    f["date"] = _to_date_series(f["date"])
+    f["signup_date"] = _to_date_series(f["signup_date"])
+    f = f.sort_values(["user_id", "date"]).reset_index(drop=True)
+
+    out_states = []
+
+    for uid, g in f.groupby("user_id", sort=False):
+        g = g.sort_values("date").copy()
+        active_dates = set(g.loc[g["is_active"].astype(bool), "date"])
+
+        states = []
+        for _, r in g.iterrows():
+            t = r["date"]
+            sdate = r["signup_date"]
+
+            if t == sdate:
+                states.append("New")
+                continue
+
+            t7_prev = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=7),
+                                        pd.to_datetime(t) - pd.Timedelta(days=1), freq="D").date)
+            t30_prev = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=30),
+                                         pd.to_datetime(t) - pd.Timedelta(days=1), freq="D").date)
+            t7_incl = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=6),
+                                        pd.to_datetime(t), freq="D").date)
+            t30_incl = set(pd.date_range(pd.to_datetime(t) - pd.Timedelta(days=29),
+                                         pd.to_datetime(t), freq="D").date)
+
+            A_today = t in active_dates
+            w7_prev = len(active_dates & t7_prev)
+            w30_prev = len(active_dates & t30_prev)
+            w7_incl = len(active_dates & t7_incl)
+            w30_incl = len(active_dates & t30_incl)
+
+            if A_today:
+                if w7_prev >= 1:
+                    states.append("Current")
+                elif w30_prev >= 1:
+                    states.append("Reactivated")
+                else:
+                    states.append("Resurrected")
+            else:
+                if w7_incl >= 1:
+                    states.append("AtRiskWAU")
+                elif w30_incl >= 1:
+                    states.append("AtRiskMAU")
+                else:
+                    states.append("Dormant")
+
+        g["lifecycle_state"] = states
+        out_states.append(g)
+
+    return pd.concat(out_states, ignore_index=True)
+
+
+def build_agg_daily_kpis(
+    fact_user_daily: pd.DataFrame,
+    users: pd.DataFrame,
+    events: pd.DataFrame,
+    *,
+    group_cols: Optional[Sequence[str]] = ("variant",),
+    active_event_names: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    Build agg_daily_kpis at grain = date x group_cols.
+    """
+    keys = _group_keys(group_cols)
+    f = fact_user_daily.copy()
+    f["date"] = _to_date_series(f["date"])
+
+    # WAU/MAU from canonical event definition
+    dau = compute_dau(events, active_event_names=active_event_names, group_cols=keys if keys else None)
+    wau = compute_wau(events, active_event_names=active_event_names, group_cols=keys if keys else None)
+    mau = compute_mau(events, active_event_names=active_event_names, group_cols=keys if keys else None)
+
+    # signups from users
+    us = users.copy()
+    us["signup_date"] = _to_date_series(us["signup_date"])
+    signup_group_cols = ["signup_date"] + [c for c in keys if c in us.columns]
+    signups = (
+        us.groupby(signup_group_cols, as_index=False)["user_id"]
+        .nunique()
+        .rename(columns={"signup_date": "date", "user_id": "signups"})
+    )
+
+    agg = (
+        f.groupby(["date"] + keys, as_index=False)
+        .agg(
+            sessions=("sessions_count", "sum"),
+            avg_session_duration_sec=("session_duration_sec", "mean"),
+            lessons_completed=("lessons_completed", "sum"),
+            xp_earned=("xp_earned", "sum"),
+            premium_users=("is_premium", "sum"),
+            active_users=("is_active", "sum"),
+        )
+    )
+
+    # use sessions_count sum / active_users
+    agg["sessions_per_active_user"] = _safe_divide(agg["sessions"], agg["active_users"])
+    agg["lessons_per_active_user"] = _safe_divide(agg["lessons_completed"], agg["active_users"])
+    agg["xp_per_active_user"] = _safe_divide(agg["xp_earned"], agg["active_users"])
+    agg["premium_share"] = _safe_divide(agg["premium_users"], agg["active_users"])
+
+    out = agg.merge(signups, on=["date"] + [c for c in keys if c in signups.columns], how="left")
+    out = out.merge(dau, on=["date"] + [c for c in keys if c in dau.columns], how="left")
+    out = out.merge(wau, on=["date"] + [c for c in keys if c in wau.columns], how="left")
+    out = out.merge(mau, on=["date"] + [c for c in keys if c in mau.columns], how="left")
+
+    for c in ["signups", "dau", "wau", "mau"]:
+        if c not in out.columns:
+            out[c] = 0
+        out[c] = out[c].fillna(0)
+
+    out["dau_mau_ratio"] = _safe_divide(out["dau"], out["mau"])
+
+    wanted = [
+        "date", *keys, "signups", "dau", "wau", "mau", "dau_mau_ratio",
+        "sessions", "avg_session_duration_sec", "sessions_per_active_user",
+        "lessons_completed", "lessons_per_active_user", "xp_earned",
+        "xp_per_active_user", "premium_users", "premium_share"
+    ]
+    wanted = [c for c in wanted if c in out.columns]
+    return out[wanted].sort_values(["date"] + keys).reset_index(drop=True)
+
+
+def build_agg_retention_cohort(
+    users: pd.DataFrame,
+    events: pd.DataFrame,
+    *,
+    n_days: Union[int, Sequence[int]] = (1, 7, 30),
+    active_event_names: Optional[Sequence[str]] = None,
+    by_variant: bool = True,
+) -> pd.DataFrame:
+    """
+    Build agg_retention_cohort directly from canonical retention definition.
+    """
+    return compute_retention(
+        users=users,
+        events=events,
+        n_days=n_days,
+        active_event_names=active_event_names,
+        by_variant=by_variant,
+        drop_incomplete=True,
+    ).reset_index(drop=True)
+
+
+def build_agg_funnel_daily(
+    events: pd.DataFrame,
+    *,
+    group_cols: Optional[Sequence[str]] = ("variant",),
+    funnel_steps: Sequence[str] = DEFAULT_FUNNEL_STEPS,
+) -> pd.DataFrame:
+    """
+    Build agg_funnel_daily at grain = date x group_cols.
+    """
+    return compute_lesson_funnel(
+        events=events,
+        funnel_steps=funnel_steps,
+        by="date",
+        users=None,
+        group_cols=group_cols,
+    ).reset_index(drop=True)
+
+
+def build_agg_lifecycle_daily(
+    fact_user_daily: pd.DataFrame,
+    *,
+    group_cols: Optional[Sequence[str]] = ("variant",),
+) -> pd.DataFrame:
+    """
+    Build agg_lifecycle_daily at grain = date x state x group_cols.
+    """
+    keys = _group_keys(group_cols)
+    f = fact_user_daily.copy()
+    f["date"] = _to_date_series(f["date"])
+
+    out = (
+        f.groupby(["date", "lifecycle_state"] + keys, as_index=False)["user_id"]
+        .nunique()
+        .rename(columns={"lifecycle_state": "state", "user_id": "users"})
+    )
+    return out.sort_values(["date", "state"] + keys).reset_index(drop=True)
+
+
+def build_dashboard_tables(
+    users: pd.DataFrame,
+    events: pd.DataFrame,
+    sessions: pd.DataFrame,
+    *,
+    active_event_names: Optional[Sequence[str]] = None,
+    retention_days: Union[int, Sequence[int]] = (1, 7, 30),
+    group_cols: Optional[Sequence[str]] = ("variant",),
+    date_min: Optional[str] = None,
+    date_max: Optional[str] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Convenience wrapper to produce all recommended dashboard-serving tables.
+    """
+    fact_user_daily = build_fact_user_daily(
+        users=users,
+        events=events,
+        sessions=sessions,
+        active_event_names=active_event_names,
+        date_min=date_min,
+        date_max=date_max,
+    )
+
+    agg_daily_kpis = build_agg_daily_kpis(
+        fact_user_daily=fact_user_daily,
+        users=users,
+        events=events,
+        group_cols=group_cols,
+        active_event_names=active_event_names,
+    )
+
+    agg_retention_cohort = build_agg_retention_cohort(
+        users=users,
+        events=events,
+        n_days=retention_days,
+        active_event_names=active_event_names,
+        by_variant=("variant" in _group_keys(group_cols)),
+    )
+
+    agg_funnel_daily = build_agg_funnel_daily(
+        events=events,
+        group_cols=group_cols,
+        funnel_steps=DEFAULT_FUNNEL_STEPS,
+    )
+
+    agg_lifecycle_daily = build_agg_lifecycle_daily(
+        fact_user_daily=fact_user_daily,
+        group_cols=group_cols,
+    )
+
+    return {
+        "fact_user_daily": fact_user_daily,
+        "agg_daily_kpis": agg_daily_kpis,
+        "agg_retention_cohort": agg_retention_cohort,
+        "agg_funnel_daily": agg_funnel_daily,
+        "agg_lifecycle_daily": agg_lifecycle_daily,
+    }
