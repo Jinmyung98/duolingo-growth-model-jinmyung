@@ -6,15 +6,17 @@ services:
     container_name: superset
     ports:
       - "8088:8088"
+    env_file:
+      - ../.env
     environment:
-      SUPERSET_SECRET_KEY: secret_key
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
     depends_on:
       - postgres
     restart: unless-stopped
     command: >
       /bin/sh -c "
       superset db upgrade &&
-      superset fab create-admin --username admin --firstname admin --lastname user --email admin@example.com --password admin || true &&
+      superset fab create-admin --username ${SUPERSET_ADMIN_USERNAME} --firstname admin --lastname user --email ${SUPERSET_ADMIN_EMAIL} --password ${SUPERSET_ADMIN_PASSWORD} || true &&
       superset init &&
       superset run -h 0.0.0.0 -p 8088
       "
