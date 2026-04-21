@@ -40,6 +40,8 @@ Core metrics:
 - D1 / D7 / D30 retention
 - Lifecycle mix: New, Current, Reactivated, Resurrected
 
+![Growth Overview Dashboard](docs/images/growth-overview-dashboard-2026-04-21T03-22-58.247Z.jpg)
+
 ---
 
 ### 2. Mature Product Health Dashboard
@@ -60,6 +62,8 @@ Core metrics:
 - Premium conversion / premium usage
 - Lifecycle mix: Current, At Risk WAU, At Risk MAU, Dormant
 
+![Mature Product Health Dashboard](docs/images/mature-product-health-dashboard-2026-04-21T03-23-10.480Z.jpg)
+
 ---
 
 ### 3. A/B Test Dashboard
@@ -78,5 +82,7 @@ Core metrics:
 - Streak / habit metrics
 - Treatment lift over time
 - Guardrail metrics such as session duration or lesson completion
+
+![A/B Test Dashboard](docs/images/a-b-test-dashboard-2026-04-21T03-23-22.294Z.jpg)
 
 ---
